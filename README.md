@@ -61,9 +61,3 @@ Representative entry scripts:
 - `miou.py`
 - `run_jetson.py`
 
-
-## Notes
-
-- The current codebase keeps the two modules independent, which is good for open-source maintenance.
-- Before release, it is worth cleaning hard-coded local paths, large experiment outputs, and temporary cache files.
-- Some internal path strings may still reference older names such as `disaster_lora/...`, so they should be checked before release.
