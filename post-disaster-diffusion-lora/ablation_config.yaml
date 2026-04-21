@@ -1,0 +1,209 @@
+# Central configuration for the ablation pipeline.
+# Run with:
+#   python disaster_lora/run_full_ablation.py --config disaster_lora/ablation_config.yaml
+
+# Dataset root prepared by 2_prepare_training_data.py.
+data_dir: "./disaster_lora/training_data"
+
+# Local checkpoints produced by Stage 1 and Stage 2 training.
+stage1_checkpoint: "./disaster_lora/output/stage1/checkpoint-30000"
+stage2_checkpoint: "./disaster_lora/output/stage2/checkpoint-14000"
+
+# Baseline model used for comparison.
+baseline_model: "runwayml/stable-diffusion-inpainting"
+
+# Default inference parameters used by the final method.
+best_params:
+  padding: 50
+  strength: 0.9
+  guidance_scale: 10.0
+  num_inference_steps: 50
+  mask_dilate_kernel: 25
+  feather_pixels: 25
+  seed: 0
+
+# Per-experiment generation quotas.
+quotas:
+  # A0, A1, and A2 main comparison experiments.
+  main:
+    L1_to: [100, 100, 100, 100]
+    L2_to: [100, 100, 100, 100]
+    L3_to: [100, 100, 100, 100]
+    L4_to: [50, 50, 50, 50]
+
+  # A3 only evaluates target L4 generations.
+  l4_only:
+    L1_to: [0, 0, 0, 150]
+    L2_to: [0, 0, 0, 150]
+    L3_to: [0, 0, 0, 150]
+    L4_to: [0, 0, 0, 50]
+
+  # A4-A7 sweep experiments use a smaller budget.
+  sweep:
+    L1_to: [20, 20, 20, 20]
+    L2_to: [20, 20, 20, 20]
+    L3_to: [20, 20, 20, 20]
+    L4_to: [10, 10, 10, 10]
+
+# Shared subset sampling used to build a stable reference list.
+base_sampling:
+  enabled: true
+  per_level: 150
+  sweep_per_level: 50
+  seed: 0
+  subset_seed: 0
+  base_manifest: "./runs_ablation/base_manifest.json"
+
+# Prompts for the baseline model without level tokens.
+prompts_A0_baseline:
+  L1_pos: "aerial view of intact building, no damage, complete structure"
+  L1_neg: "damaged, collapsed, destroyed, debris, rubble"
+  L2_pos: "aerial view of minor damaged building, slight roof damage"
+  L2_neg: "collapsed, destroyed, rubble, debris field"
+  L3_pos: "aerial view of major damaged building, severe structural damage"
+  L3_neg: "intact roof, undamaged, perfect condition"
+  L4_pos: "aerial view of completely destroyed building, rubble and debris"
+  L4_neg: "house, structure, standing walls, intact roof"
+
+# Prompts for Stage 1 / Stage 2 models with level tokens.
+prompts_A1_A2_A3:
+  L1_pos: "aerial view of post-disaster building damage <L1>"
+  L1_neg: "damaged, collapsed, rubble, debris"
+  L2_pos: "aerial view of post-disaster building damage <L2>"
+  L2_neg: "collapsed, destroyed, rubble, debris field"
+  L3_pos: "aerial view of post-disaster building damage <L3>"
+  L3_neg: "intact roof, undamaged, perfect condition"
+  L4_pos: "aerial view, debris field, completely destroyed building, no intact roof, scattered rubble, dust, irregular boundary <L4>"
+  L4_neg: "intact roof, floorplan, rooms, clean interior, architectural drawing, blueprint, undamaged, organized structure"
+
+# Experiment registry.
+experiments:
+  - id: A0
+    name: "Overall Baseline"
+    enabled: true
+    model: baseline
+    quota_type: main
+
+  - id: A1
+    name: "Stage1 Shared Adapter"
+    enabled: true
+    model: stage1
+    quota_type: main
+
+  - id: A2
+    name: "Final Method (Stage 2 + Routed L4)"
+    enabled: true
+    model: stage2
+    routing: routed
+    quota_type: main
+
+  - id: A3
+    name: "L4 Adapter Ablation"
+    enabled: true
+    model: stage2
+    routing: shared_only
+    quota_type: l4_only
+
+  - id: A4
+    name: "CFG Sweep"
+    enabled: true
+    model: stage2
+    routing: routed
+    quota_type: sweep
+    sweep_param: guidance_scale
+    sweep_values: [0, 5, 7, 10, 12]
+
+  - id: A5
+    name: "Strength Sweep"
+    enabled: true
+    model: stage2
+    routing: routed
+    quota_type: sweep
+    sweep_param: strength
+    sweep_values: [0.75, 0.85, 0.90, 0.95]
+
+  - id: A6
+    name: "Steps Comparison"
+    enabled: true
+    model: stage2
+    routing: routed
+    quota_type: sweep
+    sweep_param: num_inference_steps
+    sweep_values: [25, 50]
+
+  - id: A7
+    name: "Mask Dilation Sweep"
+    enabled: true
+    model: stage2
+    routing: routed
+    quota_type: sweep
+    sweep_param: mask_dilate_kernel
+    sweep_values: [0, 15, 25, 40]
+
+# Metric switches and settings.
+metrics:
+  compute_kid: true
+  compute_fid: false
+  compute_lpips: true
+  compute_bg_preserve: true
+  compute_boundary_ring: true
+  inception_model: "inception_v3"
+  feature_dim: 2048
+  ring_dilate_outer: 30
+  ring_dilate_inner: 5
+
+# Visualization settings used by ablation_visualize.py.
+visualization:
+  control_grid:
+    num_samples: 5
+    experiments: ["A0", "A1", "A2"]
+
+  l4_zoom:
+    num_samples: 15
+    zoom_size: 200
+    experiments: ["A2", "A3"]
+
+  sweeps:
+    - experiment: A7
+      type: local_zoom
+      num_samples: 10
+
+    - experiment: A4
+      type: trend_plot
+
+    - experiment: A5
+      type: trend_plot
+
+# Summary table export.
+summary:
+  output_format: ["csv", "xlsx"]
+  columns:
+    - "KID_L1"
+    - "KID_L2"
+    - "KID_L3"
+    - "KID_L4"
+    - "bg_ssim"
+    - "bg_psnr"
+    - "ring_score"
+    - "inference_time"
+
+  plots:
+    - type: "bar"
+      title: "KID Comparison"
+      experiments: ["A0", "A1", "A2"]
+      metric: "KID_L4"
+
+    - type: "line"
+      title: "CFG Sweep"
+      experiments: ["A4"]
+      x_axis: "guidance_scale"
+      y_axis: "KID_L4"
+
+# Runtime defaults.
+runtime:
+  device: "cuda"
+  batch_size: 2
+  num_workers: 4
+  mixed_precision: "fp16"
+  save_intermediate: true
+  verbose: true
