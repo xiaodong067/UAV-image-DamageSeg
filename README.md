@@ -61,16 +61,6 @@ Representative entry scripts:
 - `miou.py`
 - `run_jetson.py`
 
-## Suggested Open-Source Positioning
-
-The parent repository name can use:
-
-- `Post-Disaster-Damage-Assessment`
-
-If you want a shorter repo name, you can also use:
-
-- `DamageAssessmentLab`
-- `DisasterDamageVision`
 
 ## Notes
 
