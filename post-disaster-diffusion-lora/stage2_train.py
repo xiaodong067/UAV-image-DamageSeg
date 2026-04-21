@@ -18,7 +18,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
@@ -43,6 +43,8 @@ class Config:
     data_dir = "./disaster_lora/training_data"
     output_dir = "./disaster_lora/output/stage2"
     checkpoint_path = None
+    val_ratio = 0.1
+    min_val_per_level = 1
     
     resolution = 512
     train_batch_size = 4
@@ -127,6 +129,50 @@ config = Config()
 eval_config = EvalConfig()
 
 
+def load_metadata_samples(data_dir: str) -> List[dict]:
+    data_dir = Path(data_dir)
+    with open(data_dir / "metadata.json", 'r') as f:
+        metadata = json.load(f)
+
+    return [
+        {
+            "image_path": sample["image_path"],
+            "masked_path": sample["masked_path"],
+            "mask_path": sample["mask_path"],
+            "level": sample["level"],
+        }
+        for sample in metadata["samples"]
+    ]
+
+
+def stratified_train_val_split(samples: List[dict], val_ratio: float, seed: int, min_val_per_level: int = 1):
+    grouped = defaultdict(list)
+    for sample in samples:
+        grouped[sample["level"]].append(sample)
+
+    train_samples, val_samples = [], []
+    for level, level_samples in sorted(grouped.items()):
+        level_samples = list(level_samples)
+        rng = np.random.default_rng(seed + int(level))
+        indices = np.arange(len(level_samples))
+        rng.shuffle(indices)
+
+        if len(level_samples) <= 1 or val_ratio <= 0:
+            val_count = 0
+        else:
+            val_count = max(min_val_per_level, int(round(len(level_samples) * val_ratio)))
+            val_count = min(val_count, len(level_samples) - 1)
+
+        val_index_set = set(indices[:val_count].tolist())
+        for idx, sample in enumerate(level_samples):
+            if idx in val_index_set:
+                val_samples.append(sample)
+            else:
+                train_samples.append(sample)
+
+    return train_samples, val_samples
+
+
 # ============== 模块（支持多卡同步）==============
 class SeverityEmbedding(nn.Module):
     def __init__(self, num_classes: int, embed_dim: int):
@@ -153,27 +199,17 @@ class NewTokenEmbedding(nn.Module):
 
 # ============== Dataset ==============
 class DisasterDataset(Dataset):
-    def __init__(self, data_dir: str, tokenizer: CLIPTokenizer, resolution: int = 512):
-        self.data_dir = Path(data_dir)
+    def __init__(self, samples: List[dict], tokenizer: CLIPTokenizer, resolution: int = 512, split_name: str = "train"):
         self.tokenizer = tokenizer
         self.resolution = resolution
-        
-        with open(self.data_dir / "metadata.json", 'r') as f:
-            metadata = json.load(f)
-        
-        self.samples = []
+        self.split_name = split_name
+        self.samples = list(samples)
         self.level_indices = defaultdict(list)
-        
-        for idx, sample in enumerate(metadata['samples']):
-            self.samples.append({
-                'image_path': sample['image_path'],
-                'masked_path': sample['masked_path'], 
-                'mask_path': sample['mask_path'],
-                'level': sample['level']
-            })
+
+        for idx, sample in enumerate(self.samples):
             self.level_indices[sample['level']].append(idx)
-        
-        print(f"Dataset: {len(self.samples)} samples")
+
+        print(f"{self.split_name} dataset: {len(self.samples)} samples")
         for level in sorted(self.level_indices.keys()):
             print(f"  L{level}: {len(self.level_indices[level])} samples")
         
@@ -449,10 +485,13 @@ def run_visualization(unet, vae, text_encoder, noise_scheduler, severity_embeddi
     """
     unet.eval()
     device = accelerator.device
+    if len(dataset) == 0:
+        return
     ntm = new_token_module.module if hasattr(new_token_module, 'module') else new_token_module
     new_token_emb = ntm()
     
-    indices = np.random.choice(len(dataset), num_samples, replace=False)
+    sample_count = min(num_samples, len(dataset))
+    indices = np.random.choice(len(dataset), sample_count, replace=False)
     
     all_originals, all_masks = [], []
     level_outputs = {1: [], 2: [], 3: [], 4: []}
@@ -783,11 +822,27 @@ def train_stage2(args):
     print_trainable_params(unet, "UNet (l4 adapter)")
     
     # ========== 数据集 ==========
-    dataset = DisasterDataset(config.data_dir, tokenizer, config.resolution)
-    sample_weights = dataset.get_sample_weights(l4_ratio=config.l4_oversample_ratio)
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(dataset), replacement=True)
-    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, 
-                            sampler=sampler, num_workers=4, pin_memory=True)
+    all_samples = load_metadata_samples(config.data_dir)
+    train_samples, val_samples = stratified_train_val_split(
+        all_samples, config.val_ratio, config.seed, config.min_val_per_level
+    )
+    train_l4_samples = [sample for sample in train_samples if sample["level"] == 4]
+    if not train_l4_samples:
+        raise ValueError("Stage 2 requires at least one L4 sample in the training split.")
+
+    train_dataset = DisasterDataset(train_l4_samples, tokenizer, config.resolution, split_name="train_l4")
+    val_dataset = DisasterDataset(val_samples, tokenizer, config.resolution, split_name="val")
+    vis_dataset = val_dataset if len(val_dataset) > 0 else train_dataset
+    if len(val_dataset) == 0:
+        print("Warning: validation split is empty, visualization falls back to the training split.")
+
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.train_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
     
     # ========== 优化器 ==========
     trainable_params = list(filter(lambda p: p.requires_grad, unet.parameters()))
@@ -808,7 +863,8 @@ def train_stage2(args):
     
     print(f"\nTraining config:")
     print(f"  max_steps={config.max_steps}, save_steps={config.save_steps}, eval_steps={eval_config.eval_steps}")
-    print(f"  L4 oversample ratio={config.l4_oversample_ratio}, L4 loss weight={config.l4_loss_weight}")
+    print(f"  Dataset split: train_l4={len(train_dataset)}, val={len(val_dataset)}")
+    print(f"  L4 loss weight={config.l4_loss_weight}")
     print(f"  Strategy: shared merged into base, only l4 adapter trainable (lr={config.l4_lora_lr})")
     
     global_step = 0
@@ -816,7 +872,7 @@ def train_stage2(args):
     # 初始可视化
     accelerator.wait_for_everyone()
     run_visualization(unet, vae, text_encoder, noise_scheduler, severity_embedding, 
-                      dataset, tokenizer, visualizer, accelerator, 0, 
+                      vis_dataset, tokenizer, visualizer, accelerator, 0, 
                       new_token_ids, new_token_module, num_samples=4)
     accelerator.wait_for_everyone()
     
@@ -847,7 +903,7 @@ def train_stage2(args):
             if global_step % eval_config.eval_steps == 0:
                 accelerator.wait_for_everyone()
                 run_visualization(unet, vae, text_encoder, noise_scheduler, severity_embedding, 
-                                  dataset, tokenizer, visualizer, accelerator, global_step, 
+                                  vis_dataset, tokenizer, visualizer, accelerator, global_step, 
                                   new_token_ids, new_token_module, num_samples=4)
                 accelerator.wait_for_everyone()
             
@@ -890,6 +946,7 @@ def main():
     parser.add_argument("--l4_lr", type=float, default=None)
     parser.add_argument("--l4_ratio", type=float, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--val_ratio", type=float, default=None)
     
     args = parser.parse_args()
     
@@ -900,8 +957,10 @@ def main():
     if args.batch_size: config.train_batch_size = args.batch_size
     if args.lr: config.learning_rate = args.lr
     if args.l4_lr: config.l4_lora_lr = args.l4_lr
-    if args.l4_ratio: config.l4_oversample_ratio = args.l4_ratio
+    if args.l4_ratio is not None:
+        print("Warning: --l4_ratio is deprecated because Stage 2 now trains on the L4-only split.")
     if args.max_steps: config.max_steps = args.max_steps
+    if args.val_ratio is not None: config.val_ratio = args.val_ratio
     
     train_stage2(args)
 
