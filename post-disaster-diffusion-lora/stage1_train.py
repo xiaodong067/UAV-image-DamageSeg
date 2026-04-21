@@ -23,7 +23,8 @@ from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from peft import LoraConfig, get_peft_model
 import numpy as np
 from torchvision import transforms
-from typing import Optional, Dict
+from typing import Dict, List, Optional
+from collections import defaultdict
 
 import sys
 from pathlib import Path
@@ -36,6 +37,8 @@ class Config:
     pretrained_model = "runwayml/stable-diffusion-inpainting"
     data_dir = "./disaster_lora/training_data"
     output_dir = "./disaster_lora/output/stage1"
+    val_ratio = 0.1
+    min_val_per_level = 1
     
     resolution = 512
     train_batch_size = 2
@@ -73,6 +76,50 @@ config = Config()
 eval_config = EvalConfig()
 
 
+def load_metadata_samples(data_dir: str) -> List[Dict]:
+    data_dir = Path(data_dir)
+    with open(data_dir / "metadata.json", 'r') as f:
+        metadata = json.load(f)
+
+    return [
+        {
+            "image_path": sample["image_path"],
+            "masked_path": sample["masked_path"],
+            "mask_path": sample["mask_path"],
+            "level": sample["level"],
+        }
+        for sample in metadata["samples"]
+    ]
+
+
+def stratified_train_val_split(samples: List[Dict], val_ratio: float, seed: int, min_val_per_level: int = 1):
+    grouped = defaultdict(list)
+    for sample in samples:
+        grouped[sample["level"]].append(sample)
+
+    train_samples, val_samples = [], []
+    for level, level_samples in sorted(grouped.items()):
+        level_samples = list(level_samples)
+        rng = np.random.default_rng(seed + int(level))
+        indices = np.arange(len(level_samples))
+        rng.shuffle(indices)
+
+        if len(level_samples) <= 1 or val_ratio <= 0:
+            val_count = 0
+        else:
+            val_count = max(min_val_per_level, int(round(len(level_samples) * val_ratio)))
+            val_count = min(val_count, len(level_samples) - 1)
+
+        val_index_set = set(indices[:val_count].tolist())
+        for idx, sample in enumerate(level_samples):
+            if idx in val_index_set:
+                val_samples.append(sample)
+            else:
+                train_samples.append(sample)
+
+    return train_samples, val_samples
+
+
 # ============== 模块 ==============
 class SeverityEmbeddingWrapper(nn.Module):
     def __init__(self, num_classes: int, embed_dim: int):
@@ -99,27 +146,22 @@ class NewTokenEmbedding(nn.Module):
 
 # ============== Dataset ==============
 class DisasterDataset(Dataset):
-    def __init__(self, data_dir: str, tokenizer: CLIPTokenizer, resolution: int = 512):
-        self.data_dir = Path(data_dir)
+    def __init__(self, samples: List[Dict], tokenizer: CLIPTokenizer, resolution: int = 512, split_name: str = "train"):
         self.tokenizer = tokenizer
         self.resolution = resolution
+        self.split_name = split_name
+        self.samples = list(samples)
         
         # 加载metadata.json获取样本信息
-        with open(self.data_dir / "metadata.json", 'r') as f:
-            metadata = json.load(f)
+        grouped = defaultdict(int)
+        for sample in self.samples:
+            grouped[sample["level"]] += 1
         
         # 适配你的数据格式：从metadata中的samples获取路径信息
-        self.samples = []
-        for sample in metadata['samples']:
+        print(f"{self.split_name} dataset: {len(self.samples)} samples")
+        for level in sorted(grouped.keys()):
             # 你的数据格式中路径已经是完整路径，直接使用
-            self.samples.append({
-                'image_path': sample['image_path'],
-                'masked_path': sample['masked_path'], 
-                'mask_path': sample['mask_path'],
-                'level': sample['level']
-            })
-        
-        print(f"Dataset: {len(self.samples)} samples (all levels)")
+            print(f"  L{level}: {grouped[level]} samples")
         
         self.image_transforms = transforms.Compose([
             transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -257,13 +299,16 @@ def run_visualization(unet, vae, text_encoder, noise_scheduler, severity_wrapper
     """
     unet.eval()
     device = accelerator.device
+    if len(dataset) == 0:
+        return
     
     new_token_emb = None
     if new_token_ids is not None and new_token_module is not None:
         ntm = new_token_module.module if hasattr(new_token_module, 'module') else new_token_module
         new_token_emb = ntm()
     
-    indices = np.random.choice(len(dataset), num_samples, replace=False)
+    sample_count = min(num_samples, len(dataset))
+    indices = np.random.choice(len(dataset), sample_count, replace=False)
     
     all_originals = []
     all_masks = []
@@ -393,8 +438,23 @@ def train_stage1(args):
     if config.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     
-    dataset = DisasterDataset(config.data_dir, tokenizer, config.resolution)
-    dataloader = DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    all_samples = load_metadata_samples(config.data_dir)
+    train_samples, val_samples = stratified_train_val_split(
+        all_samples, config.val_ratio, config.seed, config.min_val_per_level
+    )
+    train_dataset = DisasterDataset(train_samples, tokenizer, config.resolution, split_name="train")
+    val_dataset = DisasterDataset(val_samples, tokenizer, config.resolution, split_name="val")
+    vis_dataset = val_dataset if len(val_dataset) > 0 else train_dataset
+    if len(val_dataset) == 0:
+        print("Warning: validation split is empty, visualization falls back to the training split.")
+
+    dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.train_batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
     
     trainable_params = (
         list(filter(lambda p: p.requires_grad, unet.parameters()))
@@ -409,12 +469,13 @@ def train_stage1(args):
     vae.to(accelerator.device, dtype=torch.float32)
     
     print(f"Training: max_steps={config.max_steps}, save_steps={config.save_steps}, eval_steps={eval_config.eval_steps}")
+    print(f"Dataset split: train={len(train_dataset)}, val={len(val_dataset)}")
     global_step = 0
     
     # 初始可视化
     accelerator.wait_for_everyone()
     run_visualization(unet, vae, text_encoder, noise_scheduler, severity_wrapper, 
-                      dataset, tokenizer, visualizer, accelerator, 0, 
+                      vis_dataset, tokenizer, visualizer, accelerator, 0, 
                       new_token_ids, new_token_module, num_samples=4)
     accelerator.wait_for_everyone()
     
@@ -465,7 +526,7 @@ def train_stage1(args):
             if global_step % eval_config.eval_steps == 0:
                 accelerator.wait_for_everyone()
                 run_visualization(unet, vae, text_encoder, noise_scheduler, severity_wrapper, 
-                                  dataset, tokenizer, visualizer, accelerator, global_step, 
+                                  vis_dataset, tokenizer, visualizer, accelerator, global_step, 
                                   new_token_ids, new_token_module, num_samples=4)
                 accelerator.wait_for_everyone()
             
@@ -501,11 +562,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--val_ratio", type=float, default=None)
     
     args = parser.parse_args()
     
     if args.output_dir:
         config.output_dir = args.output_dir
+    if args.val_ratio is not None:
+        config.val_ratio = args.val_ratio
     if args.save_steps:
         config.save_steps = args.save_steps
     if args.eval_steps:
